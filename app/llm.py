@@ -231,10 +231,18 @@ def render_predictions_block(result: dict) -> str:
     if coverage is not None:
         lines.append(f"- 舌体分割覆盖率：{coverage:.1%}")
 
-    # 分析方法
+    # 分析方法（结合分割后端 + 推理方式）
     ml_used = result.get("ml_model_used", False)
-    method = "深度学习模型" if ml_used else "规则推理（颜色特征）"
-    lines.append(f"- 分析方法：{method}")
+    _backend_labels = {
+        "hsv": "HSV 色彩阈值分割",
+        "hsv_fallback": "HSV 兜底（区域生长）分割",
+        "u2net": "U2-Net 深度学习分割",
+        "u2net_fallback": "U2-Net 兜底分割",
+    }
+    seg_backend = seg.get("backend", "hsv")
+    seg_label = _backend_labels.get(seg_backend, seg_backend)
+    inference_label = "深度学习模型" if ml_used else "规则推理（颜色特征）"
+    lines.append(f"- 分析方法：{seg_label} + {inference_label}")
 
     return "\n".join(lines) if lines else "- （无可用判读数据）"
 

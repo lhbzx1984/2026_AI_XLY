@@ -324,7 +324,17 @@ def run_analysis(image, consent_checked, minor_consent_checked, agnes_api_key, a
         contour_img = seg["contour_image"]
 
         # 生成舌质分析结果
-        method_tag = "🤖 深度学习模型" if ml_used else "📊 规则推理（颜色特征）"
+        # 分析方法标签（结合分割后端 + 推理方式）
+        _backend_labels = {
+            "hsv": "HSV 色彩阈值",
+            "hsv_fallback": "HSV 兜底（区域生长）",
+            "u2net": "U2-Net 深度学习",
+            "u2net_fallback": "U2-Net 兜底",
+        }
+        seg_backend = seg.get("backend", "hsv")
+        seg_label = _backend_labels.get(seg_backend, seg_backend)
+        inference_label = "🤖 深度学习模型" if ml_used else "📊 规则推理（颜色特征）"
+        method_tag = f"{seg_label}分割 + {inference_label}"
         confidence_str = ""
         if body.get("confidence") is not None:
             confidence_str = f"\n\n**模型置信度**: {body['confidence']:.1%}"

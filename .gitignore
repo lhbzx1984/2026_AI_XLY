@@ -34,8 +34,8 @@ Thumbs.db
 desktop.ini
 
 # 模型权重文件（体积大，按需提交）
+# onnx 文件通过 Git LFS 管理，不忽略
 *.pth
-*.onnx
 *.pt
 
 # 临时文件

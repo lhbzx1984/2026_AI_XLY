@@ -164,8 +164,17 @@ def generate_report_html(
     # 颜色色块
     color_hex = _rgb_to_hex(mean_color)
 
-    # 分析方法
-    method_label = "深度学习模型" if ml_used else "规则推理（颜色特征）"
+    # 分析方法（结合分割后端 + 推理方式）
+    _backend_labels = {
+        "hsv": "HSV 色彩阈值分割",
+        "hsv_fallback": "HSV 兜底（区域生长）分割",
+        "u2net": "U2-Net 深度学习分割",
+        "u2net_fallback": "U2-Net 兜底分割",
+    }
+    seg_backend = seg.get("backend", "hsv")
+    seg_label = _backend_labels.get(seg_backend, seg_backend)
+    inference_label = "深度学习模型" if ml_used else "规则推理（颜色特征）"
+    method_label = f"{seg_label} + {inference_label}"
 
     # 置信度
     body_conf = f"{body['confidence']:.1%}" if body.get("confidence") is not None else "—"
