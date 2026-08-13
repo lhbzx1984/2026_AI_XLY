@@ -40,7 +40,7 @@ from app.knowledge import (
     TONGUE_COATING_TYPES,
     CONSTITUTION_MAP,
 )
-from app.landing import get_landing_html, get_landing_css, get_landing_js, get_diagnosis_header_html
+from app.landing import get_landing_html, get_landing_css, get_landing_js, get_diagnosis_header_html, _img
 from app.llm import (
     save_api_key,
     load_api_key,
@@ -54,6 +54,120 @@ from app.llm import (
 # ===== 全局状态：存储最近一次分析结果（用于报告生成）=====
 _last_result = None
 _last_image = None
+
+
+# ============================================================
+# 中医舌诊图谱 HTML 生成（医院标准参考）
+# ============================================================
+# 健康状态 -> 颜色映射
+_STATUS_COLOR = {
+    "正常": "#16a34a",
+    "需关注": "#ea580c",
+    "建议就医": "#dc2626",
+}
+
+
+def _atlas_card(info: dict, img_key: str) -> str:
+    """
+    生成单张舌诊图谱卡片的 HTML。
+
+    参数:
+        info: 知识库中该类型的字典（name/description/tcm_meaning/health_status/advice）
+        img_key: 图片文件名（不含扩展名，对应 atlas 目录下的 jpg 文件）
+
+    返回:
+        单张卡片的 HTML 字符串
+    """
+    name = info.get("name", img_key)
+    name_en = info.get("name_en", "")
+    description = info.get("description", "")
+    tcm_meaning = info.get("tcm_meaning", "")
+    health_status = info.get("health_status", "")
+    advice = info.get("advice", "")
+
+    # base64 内嵌图片
+    img_src = _img(f"atlas/{img_key}.jpg")
+    img_html = (
+        f'<img src="{img_src}" alt="{name}" loading="lazy" '
+        f'style="width:100%;height:160px;object-fit:cover;display:block;" />'
+        if img_src
+        else '<div style="width:100%;height:160px;background:#f3f4f6;display:flex;'
+        f'align-items:center;justify-content:center;color:#9ca3af;font-size:13px;">图片加载中</div>'
+    )
+
+    status_color = _STATUS_COLOR.get(health_status, "#6b7280")
+
+    return f"""
+    <div style="background:#fff;border-radius:12px;overflow:hidden;
+         box-shadow:0 2px 8px rgba(0,0,0,0.08);border:1px solid #e5e7eb;
+         display:flex;flex-direction:column;transition:transform 0.2s,box-shadow 0.2s;"
+         onmouseover="this.style.transform='translateY(-4px)';this.style.boxShadow='0 8px 24px rgba(0,0,0,0.15)';"
+         onmouseout="this.style.transform='translateY(0)';this.style.boxShadow='0 2px 8px rgba(0,0,0,0.08)';">
+      {img_html}
+      <div style="padding:14px;flex:1;display:flex;flex-direction:column;gap:6px;">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+          <span style="font-size:17px;font-weight:700;color:#1f2937;">{name}</span>
+          <span style="font-size:11px;font-weight:600;color:{status_color};
+               background:{status_color}1a;padding:2px 10px;border-radius:12px;
+               white-space:nowrap;">{health_status}</span>
+        </div>
+        <span style="font-size:11px;color:#9ca3af;font-style:italic;">{name_en}</span>
+        <p style="font-size:13px;color:#4b5563;margin:0;line-height:1.5;">{description}</p>
+        <p style="font-size:12px;color:#6b7280;margin:0;line-height:1.5;
+           padding:6px 10px;background:#f9fafb;border-radius:6px;border-left:3px solid {status_color};">
+           <strong>中医意义：</strong>{tcm_meaning}</p>
+        <p style="font-size:12px;color:#6b7280;margin:0;line-height:1.5;">{advice}</p>
+      </div>
+    </div>
+    """
+
+
+def build_atlas_html() -> str:
+    """
+    生成完整的中医舌诊图谱 HTML（医院标准参考）。
+
+    包含舌质图谱（5 种）和舌苔图谱（6 种），每种类型配有标准参考图片、
+    名称、健康状态、描述、中医含义与建议。
+
+    返回:
+        完整的 HTML 字符串，用于 gr.HTML 组件展示
+    """
+    # 舌质图谱
+    body_cards = "".join(
+        _atlas_card(info, key) for key, info in TONGUE_BODY_TYPES.items()
+    )
+
+    # 舌苔图谱
+    coating_cards = "".join(
+        _atlas_card(info, key) for key, info in TONGUE_COATING_TYPES.items()
+    )
+
+    return f"""
+    <div style="font-family:'Noto Sans CJK SC','Microsoft YaHei',sans-serif;">
+      <div style="background:linear-gradient(135deg,#fef3c7,#fde68a);border-left:4px solid #d97706;
+           padding:12px 16px;border-radius:8px;margin-bottom:20px;">
+        <p style="margin:0;font-size:13px;color:#92400e;line-height:1.6;">
+          <strong>🏥 医院标准参考图谱</strong>　以下舌诊图片为 AI 生成的教学示意图，
+          用于辅助理解各舌象类型的视觉特征，不作为临床诊断依据。
+         实际诊断请以专业中医师判读为准。
+        </p>
+      </div>
+
+      <h3 style="color:#1f2937;font-size:18px;margin:0 0 14px 0;padding-bottom:8px;
+         border-bottom:2px solid #dc2626;">👅 舌质图谱（望舌体 — 反映脏腑气血盛衰）</h3>
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));
+           gap:16px;margin-bottom:28px;">
+        {body_cards}
+      </div>
+
+      <h3 style="color:#1f2937;font-size:18px;margin:0 0 14px 0;padding-bottom:8px;
+         border-bottom:2px solid #0891b2;">👅 舌苔图谱（望舌苔 — 反映胃气盛衰和病邪性质）</h3>
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));
+           gap:16px;">
+        {coating_cards}
+      </div>
+    </div>
+    """
 
 
 def generate_report_cb():
@@ -567,20 +681,11 @@ def create_app():
             # ===== 知识库区 =====
             gr.Markdown("---")
             gr.Markdown("## 📚 中医舌诊知识库")
-
-            with gr.Accordion("舌质类型说明（望舌体）", open=False):
-                for key, info in TONGUE_BODY_TYPES.items():
-                    gr.Markdown(
-                        f"**{info['name']}** ({info['name_en']}): "
-                        f"{info['description']} → {info['tcm_meaning']}"
-                    )
-
-            with gr.Accordion("舌苔类型说明（望舌苔）", open=False):
-                for key, info in TONGUE_COATING_TYPES.items():
-                    gr.Markdown(
-                        f"**{info['name']}** ({info['name_en']}): "
-                        f"{info['description']} → {info['tcm_meaning']}"
-                    )
+            gr.Markdown(
+                "> 下方为 **医院标准参考图谱**，每种舌象类型配有示意图与中医释义，"
+                "可对照识别自身舌象特征。"
+            )
+            gr.HTML(build_atlas_html())
 
             with gr.Accordion("体质类型对照表", open=False):
                 constit_table = "| 舌质 | 舌苔 | 体质类型 | 特征 |\n|------|------|----------|------|\n"
