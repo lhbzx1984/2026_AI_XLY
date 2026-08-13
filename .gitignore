@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+
+# 虚拟环境（体积大，不应提交）
+.venv/
+venv/
+env/
+
+# uv 缓存
+.lock
+CACHEDIR.TAG
+
+# 敏感信息（API Key，绝不能提交）
+.agnes_api_key
+*.key
+*.pem
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 操作系统
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 模型权重文件（体积大，按需提交）
+*.pth
+*.onnx
+*.pt
+
+# 临时文件
+*.tmp
+*.bak
+*.log
+
+# Gradio
+flagged/
