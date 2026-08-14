@@ -109,9 +109,12 @@ install_system_deps() {
     apt-get update -qq
     apt-get install -y -qq \
         python3 python3-pip python3-venv \
-        git curl wget \
+        git git-lfs curl wget \
         libgl1 libglib2.0-0 \
         ca-certificates >/dev/null 2>&1
+
+    # 初始化 Git LFS（用于 models/u2net.onnx 等大文件）
+    git lfs install &>/dev/null || log_warn "git-lfs 安装或初始化失败，大文件可能无法正确拉取"
 
     if [[ "$WITH_NGINX" == true ]]; then
         apt-get install -y -qq nginx >/dev/null 2>&1
@@ -158,6 +161,11 @@ fetch_project() {
         git clone --depth 1 "$REPO_URL" "$INSTALL_DIR"
         cd "$INSTALL_DIR"
     fi
+
+    # 拉取 Git LFS 大文件（如 models/u2net.onnx，约 176MB）
+    log_info "拉取 LFS 大文件（如 U2-Net 模型）..."
+    git lfs pull || log_warn "git lfs pull 失败，U2-Net 本地模型可能缺失（rembg 会在首次使用时自动下载）"
+
     log_ok "项目代码就绪"
 
     # 修正文件归属（让普通用户可读写）
@@ -256,7 +264,7 @@ server {
     listen 80;
     server_name _;
 
-    client_max_body_size 20M;
+    client_max_body_size 50M;
 
     location / {
         proxy_pass http://127.0.0.1:PORT;
@@ -295,8 +303,8 @@ start_service() {
     log_info "启动应用服务..."
     systemctl restart "$SERVICE_NAME"
 
-    # 等待服务启动
-    for i in {1..15}; do
+    # 等待服务启动（首次需加载 U2-Net 模型，可能较慢）
+    for i in {1..60}; do
         if curl -s "http://127.0.0.1:${APP_PORT}" -o /dev/null 2>&1; then
             log_ok "应用已启动并响应"
             return
@@ -361,7 +369,7 @@ verify_deployment() {
     fi
     echo ""
     if [[ "$WITH_U2NET" == true ]]; then
-        echo -e "  ${YELLOW}注意：${NC}U2-Net 首次使用会下载模型（约 170MB），需联网"
+        echo -e "  ${YELLOW}注意：${NC}U2-Net 模型通过 Git LFS 拉取（约 176MB），若 LFS 拉取失败将在首次使用时自动下载"
     fi
     echo ""
 }
