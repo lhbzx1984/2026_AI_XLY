@@ -49,6 +49,8 @@ from app.llm import (
     test_api_connection,
     AGNES_DEFAULT_MODEL,
 )
+from app.questionnaire import QUESTIONNAIRE
+from app.atlas import YOLO_CLASSES
 
 
 # ===== 全局状态：存储最近一次分析结果（用于报告生成）=====
@@ -232,11 +234,17 @@ def save_agnes_key_cb(api_key, model_name):
 
 def test_agnes_key_cb(api_key, model_name):
     """回调：测试 Agnes AI API Key 是否有效。"""
-    if not api_key or not api_key.strip():
-        return "❌ 请先输入 API Key"
+    # 优先使用输入框的 Key，为空则尝试从文件加载
+    key = api_key.strip() if api_key and api_key.strip() else None
+    if not key:
+        try:
+            from app.llm import resolve_api_key
+            key = resolve_api_key()
+        except RuntimeError:
+            return "❌ 请先输入 API Key，或确认 `.agnes_api_key` 文件存在"
     model = model_name.strip() if model_name and model_name.strip() else AGNES_DEFAULT_MODEL
     print(f"[TongueAI] 正在测试 Agnes AI 连接（模型: {model}）...")
-    result = test_api_connection(api_key.strip(), model=model)
+    result = test_api_connection(key, model=model)
     if result["valid"]:
         return f"✅ {result['message']}\n\n模型回复：`{result['response'][:100]}`"
     else:
@@ -252,61 +260,50 @@ def clear_agnes_key_cb():
         return "❌ 清除失败", get_api_key_fingerprint()
 
 
-def run_analysis(image, consent_checked, minor_consent_checked, agnes_api_key, agnes_model, use_llm, backend):
+def run_tongue_analysis(image, consent_checked, minor_consent_checked, backend):
     """
-    Gradio 回调函数：执行舌象分析并生成结果展示。
+    第一步：舌象分析（21类分类，不调用大模型）。
+    分析完成后结果存储在全局变量，供第二步综合报告使用。
 
     参数:
         image: 用户上传/拍摄的舌象图片
         consent_checked: 是否勾选免责声明确认
         minor_consent_checked: 是否勾选未成年人监护人同意
-        agnes_api_key: Agnes AI API Key（用户在设置中输入）
-        agnes_model: Agnes AI 模型名称
-        use_llm: 是否启用 AI 评语生成
         backend: 分割后端选择（"hsv" 或 "u2net"）
-            - "hsv": HSV 色彩阈值法（精度高不含嘴唇，但边缘可能欠分割）
-            - "u2net": U2-Net 深度学习分割（召回率高覆盖全舌体，但可能含嘴唇/面颊）
 
     返回:
-        多个 Gradio 组件的更新值
+        7个 Gradio 组件的更新值
     """
     # 检查必要确认
     if not consent_checked:
         return (
             None, "❌ 请先阅读并勾选免责声明确认框，才能进行舌象分析。",
-            "", "", "", "", "", "",
+            "", "", "", "", "",
         )
 
     if not minor_consent_checked:
         return (
             None, "❌ 未成年人使用须获得监护人同意，请勾选确认框。",
-            "", "", "", "", "", "",
+            "", "", "", "", "",
         )
 
     # 检查图片
     if image is None:
         return (
             None, "❌ 请先上传或拍摄一张舌象照片。",
-            "", "", "", "", "", "",
+            "", "", "", "", "",
         )
 
-    # 若启用 AI 评语但未提供 Key，给出提示（仍可分析，评语走规则回退）
-    effective_key = agnes_api_key.strip() if agnes_api_key else None
-    if use_llm and not effective_key:
-        print("[TongueAI] 提示：已启用 AI 评语但未提供 API Key，将使用规则回退")
-
     try:
-        # 执行分析（含 Agnes AI 评语生成）
+        # 执行舌象分析（不调用 LLM，仅做21类分类）
         result = analyze_tongue(
             image,
             use_ml_model=True,
-            agnes_api_key=effective_key,
-            agnes_model=agnes_model if agnes_model else AGNES_DEFAULT_MODEL,
-            use_llm=use_llm,
+            use_llm=False,
             backend=backend,
         )
 
-        # 存储到全局变量，供报告生成使用
+        # 存储到全局变量，供综合报告使用
         global _last_result, _last_image
         _last_result = result
         _last_image = image
@@ -319,12 +316,13 @@ def run_analysis(image, consent_checked, minor_consent_checked, agnes_api_key, a
         mean_color = result["mean_color"]
         color_swatch = result["color_swatch_html"]
         ml_used = result["ml_model_used"]
+        features = result.get("features", {})
+        yolo_labels = result.get("yolo_labels", [])
 
         # 生成舌体分割结果图
         contour_img = seg["contour_image"]
 
-        # 生成舌质分析结果
-        # 分析方法标签（结合分割后端 + 推理方式）
+        # 分析方法标签
         _backend_labels = {
             "hsv": "HSV 色彩阈值",
             "hsv_fallback": "HSV 兜底（区域生长）",
@@ -333,11 +331,55 @@ def run_analysis(image, consent_checked, minor_consent_checked, agnes_api_key, a
         }
         seg_backend = seg.get("backend", "hsv")
         seg_label = _backend_labels.get(seg_backend, seg_backend)
-        inference_label = "🤖 深度学习模型" if ml_used else "📊 规则推理（颜色特征）"
+        inference_label = "🤖 深度学习模型" if ml_used else "📊 规则推理（颜色特征+形态分析）"
         method_tag = f"{seg_label}分割 + {inference_label}"
         confidence_str = ""
         if body.get("confidence") is not None:
             confidence_str = f"\n\n**模型置信度**: {body['confidence']:.1%}"
+
+        # ===== 21类特征详情 =====
+        shape_data = features.get("shape", {})
+        red_spots = features.get("red_spots", {})
+        cracks = features.get("cracks", {})
+        teeth_marks = features.get("teeth_marks", {})
+        organ_data = features.get("organ_regions", {})
+
+        # 舌体形态
+        shape_lines = []
+        if shape_data.get("yolo_id") is not None:
+            shape_name = YOLO_CLASSES.get(shape_data["yolo_id"], {}).get("name", "异常")
+            shape_lines.append(f"- **舌体形态**: {shape_name}（{shape_data.get('description', '')}）")
+        else:
+            shape_lines.append(f"- **舌体形态**: 正常（宽高比 {shape_data.get('aspect_ratio', 'N/A')}，覆盖率 {shape_data.get('coverage', 'N/A')}）")
+
+        # 舌面特征
+        feature_lines = []
+        if red_spots.get("detected"):
+            feature_lines.append(f"红点舌（{red_spots.get('spot_count', 0)}个红点）")
+        if cracks.get("detected"):
+            feature_lines.append(f"裂纹舌（{cracks.get('crack_lines', 0)}条裂纹）")
+        if teeth_marks.get("detected"):
+            feature_lines.append(f"齿痕舌（凹陷度 {teeth_marks.get('indentation_ratio', 'N/A')}）")
+        feature_str = "、".join(feature_lines) if feature_lines else "未见明显异常"
+        shape_lines.append(f"- **舌面特征**: {feature_str}")
+
+        # 脏腑分区
+        organ_parts = []
+        for organ_name in ["心肺", "脾胃", "肾", "肝胆"]:
+            od = organ_data.get(organ_name, {})
+            state = od.get("state")
+            if state:
+                organ_parts.append(f"**{organ_name}{state}**（{od.get('description', '')}）")
+            else:
+                organ_parts.append(f"{organ_name}正常")
+        shape_lines.append(f"- **脏腑分区**: {'；'.join(organ_parts)}")
+
+        # YOLO 类别总览
+        if yolo_labels:
+            yolo_summary = "、".join(f"{yl['name']}" for yl in yolo_labels)
+            shape_lines.append(f"- **21类检测结果**: {yolo_summary}")
+
+        features_detail = "\n".join(shape_lines)
 
         body_result = f"""### 舌质分析：{body['name']}
 
@@ -347,6 +389,12 @@ def run_analysis(image, consent_checked, minor_consent_checked, agnes_api_key, a
 
 **描述**: {body['description']}
 **检测到的舌体平均颜色**: {color_swatch} RGB{mean_color}
+
+---
+
+#### 21类分类详情
+
+{features_detail}
 """
 
         # 生成舌苔分析结果
@@ -383,42 +431,26 @@ def run_analysis(image, consent_checked, minor_consent_checked, agnes_api_key, a
 本项目为教育演示用途，所有建议均为通用健康科普，不针对具体疾病。
 """
 
-        # AI 中医评语
-        ai_commentary = result.get("ai_commentary", "")
-        commentary_source = result.get("ai_commentary_source", "rule_disabled")
+        # AI 评语占位（第二步生成）
+        commentary_result = """### 🤖 AI 中医辨证评语
 
-        if commentary_source == "agnes_ai":
-            source_label = f"✅ 评语来源：Agnes AI 大模型（{agnes_model if agnes_model else AGNES_DEFAULT_MODEL}）"
-        elif commentary_source == "rule_fallback":
-            source_label = "⚠️ 评语来源：规则回退（Agnes API 不可用，请检查 API Key）"
-        else:
-            source_label = "📋 评语来源：规则生成（未启用 Agnes AI）"
-
-        commentary_result = f"""### 🤖 AI 中医辨证评语
-
-{source_label}
-
----
-
-{ai_commentary}
+⏳ **请先填写下方问卷，然后点击「📋 生成综合报告」按钮**，系统将结合舌象21类分析结果与问卷数据，通过大模型生成综合体质辨识、健康建议和疾病风险预测。
 
 ---
 
 ⚠️ **重要提醒**: AI 评语由大语言模型生成，仅供参考，不构成医疗诊断或治疗建议。
-如有健康问题，请务必咨询专业中医师。
 """
 
         # 分割信息
         seg_info = ""
         if seg["success"]:
-            backend = seg.get("backend", "hsv")
             backend_label = {
                 "hsv": "HSV 色彩阈值法",
                 "u2net": "U2-Net 深度学习",
                 "u2net_fallback": "U2-Net 不可用，已回退到 HSV",
                 "u2net_unavailable": "U2-Net 不可用，已回退到 HSV",
                 "u2net_session_failed": "U2-Net 会话失败，已回退到 HSV",
-            }.get(backend, backend)
+            }.get(seg_backend, seg_backend)
             seg_info = f"✅ 舌体分割成功，舌体面积占图像 **{seg['coverage']:.1%}**\n\n**分割后端**: {backend_label}"
         else:
             seg_info = "⚠️ 未能清晰识别舌体区域，分析结果可能不准确。请参考拍摄指南重新拍摄。"
@@ -431,7 +463,6 @@ def run_analysis(image, consent_checked, minor_consent_checked, agnes_api_key, a
             constitution_result,
             advice_result,
             commentary_result,
-            "",
         )
 
     except Exception as e:
@@ -439,8 +470,132 @@ def run_analysis(image, consent_checked, minor_consent_checked, agnes_api_key, a
         traceback.print_exc()
         return (
             None, f"❌ 分析过程出错: {str(e)}\n\n请尝试更换照片或检查拍摄条件。",
-            "", "", "", "", "", "",
+            "", "", "", "", "",
         )
+
+
+def generate_comprehensive_report(agnes_api_key, agnes_model, *questionnaire_values):
+    """
+    第二步：结合舌象分析结果 + 问卷数据，调用大模型生成综合报告。
+    使用第一步存储的 _last_result 作为舌象分析数据。
+
+    参数:
+        agnes_api_key: Agnes AI API Key
+        agnes_model: Agnes AI 模型名称
+        *questionnaire_values: 问卷答案（Gradio Radio 返回的选项文本）
+
+    返回:
+        AI 中医评语 Markdown 文本
+    """
+    global _last_result
+
+    if _last_result is None:
+        return "❌ 请先完成第一步舌象分析，再来生成综合报告。"
+
+    # 打包问卷答案（Gradio Radio 返回选项文本，需转为索引）
+    questionnaire_answers = {}
+    for i, q in enumerate(QUESTIONNAIRE):
+        if i < len(questionnaire_values) and questionnaire_values[i] is not None:
+            val = questionnaire_values[i]
+            # Radio 返回的是选项文本，转换为索引
+            if isinstance(val, str) and val in q["options"]:
+                questionnaire_answers[q["id"]] = q["options"].index(val)
+            elif isinstance(val, int) and 0 <= val < len(q["options"]):
+                questionnaire_answers[q["id"]] = val
+
+    # 解析 API Key
+    effective_key = agnes_api_key.strip() if agnes_api_key else None
+    if not effective_key:
+        # 尝试从文件加载
+        try:
+            from app.llm import resolve_api_key
+            effective_key = resolve_api_key()
+        except RuntimeError:
+            return """### 🤖 AI 中医辨证评语
+
+❌ **未配置 Agnes AI API Key**，无法生成大模型综合报告。
+
+请先在「🔑 Agnes AI 设置」中输入 API Key，或确认 `.agnes_api_key` 文件存在。
+
+---
+
+⚠️ 舌象21类分析结果已在上方显示，您仍可参考。如需 AI 综合分析，请配置 API Key 后重试。
+"""
+
+    # 格式化问卷数据
+    questionnaire_text = ""
+    if questionnaire_answers:
+        from app.questionnaire import format_questionnaire_for_llm
+        questionnaire_text = format_questionnaire_for_llm(questionnaire_answers)
+        print(f"[TongueAI] 已注入问卷数据（{len(questionnaire_answers)}题），大模型将综合舌象+问卷进行分析")
+    else:
+        print("[TongueAI] 未填写问卷，大模型将仅基于舌象分析生成报告")
+
+    # 调用大模型生成综合报告
+    try:
+        from app.llm import generate_tcm_commentary
+        model_name = agnes_model if agnes_model else AGNES_DEFAULT_MODEL
+        print(f"[TongueAI] 正在调用 Agnes AI（{model_name}）生成综合报告...")
+
+        commentary_result = generate_tcm_commentary(
+            _last_result,
+            user_api_key=effective_key,
+            model=model_name,
+            temperature=0.3,
+            max_tokens=8000,
+            questionnaire_text=questionnaire_text,
+        )
+
+        if commentary_result["success"]:
+            ai_commentary = commentary_result["comment"]
+            source_label = f"✅ 评语来源：Agnes AI 大模型（{model_name}）"
+        else:
+            error_msg = commentary_result.get("error", "")
+            ai_commentary = commentary_result.get("comment", "生成失败")
+            if "insufficient_user_quota" in str(error_msg) or "额度" in str(error_msg):
+                source_label = "⚠️ 评语来源：规则回退（Agnes AI 账户余额不足，请充值后重试）"
+            elif error_msg:
+                source_label = f"⚠️ 评语来源：规则回退（{error_msg[:80]}）"
+            else:
+                source_label = "⚠️ 评语来源：规则回退（Agnes API 不可用）"
+
+        # 回写到 _last_result，供 HTML 报告使用
+        _last_result["ai_commentary"] = ai_commentary
+        _last_result["ai_commentary_source"] = "agnes_ai" if commentary_result["success"] else "rule_fallback"
+        _last_result["ai_commentary_error"] = commentary_result.get("error")
+        _last_result["ai_commentary_success"] = commentary_result["success"]
+        # 注入问卷数据，供报告展示
+        if questionnaire_answers:
+            _last_result["questionnaire_answers"] = questionnaire_answers
+
+        # 问卷结合提示
+        questionnaire_note = ""
+        if questionnaire_answers:
+            questionnaire_note = "\n\n📝 **已结合问卷数据综合分析**（基础症状 + 生活习惯 + 既往病史），含疾病风险预测。"
+
+        return f"""### 🤖 AI 中医辨证评语
+
+{source_label}{questionnaire_note}
+
+---
+
+{ai_commentary}
+
+---
+
+⚠️ **重要提醒**: AI 评语由大语言模型生成，仅供参考，不构成医疗诊断或治疗建议。
+疾病风险预测仅为健康提示，如有健康问题，请务必咨询专业中医师或西医就诊。
+"""
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return f"""### 🤖 AI 中医辨证评语
+
+❌ 生成综合报告时出错: {str(e)}
+
+请检查 API Key 配置和网络连接后重试。
+"""
 
 
 # ============================================================
@@ -529,244 +684,279 @@ def create_app():
 
             gr.Markdown("---")
 
-            # ===== 拍摄指南 =====
-            with gr.Accordion("📸 拍摄指南（点击展开）", open=False):
-                guide_html = "<ol>"
-                for tip in PHOTO_GUIDE:
-                    guide_html += f"<li>{tip}</li>"
-                guide_html += "</ol>"
-                gr.HTML(f'<div class="guide-box">{guide_html}</div>')
+            # ===== 功能页签：舌象诊断 =====
+            with gr.Tabs():
 
-            # ===== Agnes AI 大模型设置 =====
-            with gr.Accordion("🤖 Agnes AI 大模型设置（生成中医评语，点击展开）", open=False):
-                gr.HTML(
-                    '<div style="background:#F9F0FF;border:1px solid #D3ADF7;border-radius:8px;'
-                    'padding:12px 16px;margin:8px 0 16px;font-size:13px;color:#531DAB;">'
-                    '<strong>💡 说明：</strong>配置 Agnes AI API Key 后，系统将调用大模型（替代原 Gemini API）'
-                    '生成专业的中医辨证评语。未配置或未启用时，将使用基于知识库的规则评语作为回退。<br/>'
-                    '<strong>获取 API Key：</strong>登录 <a href="https://platform.agnes-ai.com/" target="_blank">'
-                    'Agnes AI 控制台</a>，进入 API Key 管理页面创建。'
-                    '</div>'
+                # ===== Tab: 舌象诊断 =====
+                with gr.Tab("👅 舌象诊断"):
+                    # ===== 拍摄指南 =====
+                    with gr.Accordion("📸 拍摄指南（点击展开）", open=False):
+                        guide_html = "<ol>"
+                        for tip in PHOTO_GUIDE:
+                            guide_html += f"<li>{tip}</li>"
+                        guide_html += "</ol>"
+                        gr.HTML(f'<div class="guide-box">{guide_html}</div>')
+
+                    # ===== Agnes AI 大模型设置 =====
+                    with gr.Accordion("🤖 Agnes AI 大模型设置（生成中医评语，点击展开）", open=False):
+                        gr.HTML(
+                            '<div style="background:#F9F0FF;border:1px solid #D3ADF7;border-radius:8px;'
+                            'padding:12px 16px;margin:8px 0 16px;font-size:13px;color:#531DAB;">'
+                            '<strong>💡 说明：</strong>配置 Agnes AI API Key 后，系统将调用大模型（替代原 Gemini API）'
+                            '生成专业的中医辨证评语。未配置或未启用时，将使用基于知识库的规则评语作为回退。<br/>'
+                            '<strong>获取 API Key：</strong>登录 <a href="https://platform.agnes-ai.com/" target="_blank">'
+                            'Agnes AI 控制台</a>，进入 API Key 管理页面创建。'
+                            '</div>'
+                        )
+
+                        _current_fingerprint = get_api_key_fingerprint()
+                        agnes_key_status = gr.Markdown(
+                            f"**当前 API Key 状态**：`{_current_fingerprint}`"
+                        )
+
+                        with gr.Row():
+                            agnes_api_key_input = gr.Textbox(
+                                label="Agnes AI API Key",
+                                placeholder="在此粘贴你的 Agnes AI API Key（sk-... 或自定义格式）",
+                                type="password",
+                                lines=1,
+                                scale=3,
+                            )
+
+                        with gr.Row():
+                            save_key_btn = gr.Button("💾 保存 Key 到本地", variant="secondary", size="sm")
+                            test_key_btn = gr.Button("🔌 测试连接", variant="secondary", size="sm")
+                            clear_key_btn = gr.Button("🗑️ 清除已保存 Key", variant="stop", size="sm")
+
+                        with gr.Row():
+                            agnes_model_input = gr.Textbox(
+                                label="模型名称",
+                                value=AGNES_DEFAULT_MODEL,
+                                placeholder="agnes-2.5-pro",
+                                lines=1,
+                                scale=2,
+                            )
+                            use_llm_checkbox = gr.Checkbox(
+                                label="启用 Agnes AI 生成中医评语",
+                                value=True,
+                                scale=1,
+                            )
+
+                        key_test_result = gr.Markdown("")
+
+                    # ===== 主交互区 =====
+                    with gr.Row():
+                        with gr.Column(scale=1):
+                            gr.Markdown("### 📷 上传或拍摄舌象照片")
+                            image_input = gr.Image(
+                                label="舌象照片",
+                                type="numpy",
+                                sources=["upload", "webcam"],
+                                height=300,
+                            )
+                            seg_backend_radio = gr.Radio(
+                                label="分割后端（选择舌体识别算法）",
+                                choices=[("HSV 色彩阈值法", "hsv"), ("U2-Net 深度学习", "u2net")],
+                                value="hsv",
+                                info="HSV：精度高不含嘴唇，但边缘可能欠分割 | "
+                                     "U2-Net：召回率高覆盖全舌体，但可能含嘴唇/面颊。"
+                                     "若 U2-Net 不可用（rembg 未安装）将自动回退到 HSV。",
+                            )
+                            analyze_btn = gr.Button(
+                                "🔍 开始舌象分析",
+                                variant="primary",
+                                size="lg",
+                            )
+
+                        with gr.Column(scale=1):
+                            gr.Markdown("### 🔬 舌体分割结果")
+                            seg_output = gr.Image(
+                                label="舌体识别标注",
+                                type="numpy",
+                                height=300,
+                            )
+                            seg_info = gr.Markdown("")
+
+                    # ===== 配套问卷（分析完成后填写，用于综合报告）=====
+                    with gr.Accordion("📝 健康问卷（分析完成后填写，用于生成综合报告）", open=False):
+                        gr.HTML(
+                            '<div style="background:#FFF7E6;border:1px solid #FAAD14;border-radius:8px;'
+                            'padding:12px 16px;margin:8px 0 16px;font-size:13px;color:#92400E;">'
+                            '<strong>💡 说明：</strong>先完成上方舌象分析，再填写以下问卷。'
+                            '填写后点击「📋 生成综合报告」，系统将结合舌象21类分析与问卷数据，'
+                            '通过大模型综合给出体质辨识、健康建议和疾病风险预测。问卷数据仅在本次分析中使用，不会保存。'
+                            '</div>'
+                        )
+                        questionnaire_components = []
+                        current_section = ""
+                        for q in QUESTIONNAIRE:
+                            if q["section"] != current_section:
+                                current_section = q["section"]
+                                gr.Markdown(f"#### {current_section}")
+                            radio = gr.Radio(
+                                label=q["question"],
+                                choices=q["options"],
+                                value=None,
+                            )
+                            questionnaire_components.append(radio)
+
+                        generate_report_btn = gr.Button(
+                            "📋 生成综合报告",
+                            variant="primary",
+                            size="lg",
+                        )
+
+                    gr.Markdown("---")
+
+                    # ===== 分析结果区 =====
+                    gr.Markdown("## 📋 分析结果")
+
+                    with gr.Row():
+                        with gr.Column():
+                            body_output = gr.Markdown("等待分析...")
+                        with gr.Column():
+                            coating_output = gr.Markdown("等待分析...")
+
+                    with gr.Row():
+                        with gr.Column():
+                            constitution_output = gr.Markdown("")
+
+                    gr.Markdown("---")
+
+                    with gr.Row():
+                        advice_output = gr.Markdown("")
+
+                    gr.Markdown("---")
+
+                    # ===== AI 中医评语区 =====
+                    with gr.Row():
+                        commentary_output = gr.Markdown("")
+
+                    # ===== 报告生成与导出区 =====
+                    gr.Markdown("---")
+                    gr.Markdown("## 📄 分析报告")
+                    gr.Markdown(
+                        '<div style="background:#E6F7FF;border:1px solid #91D5FF;border-radius:8px;'
+                        'padding:12px 16px;margin:8px 0 16px;font-size:13px;color:#003A8C;">'
+                        '<strong>💡 使用提示：</strong>点击「生成分析报告」后，报告内将显示'
+                        '<strong style="color:#00B4D8;">「打印 / 导出 PDF」</strong>和'
+                        '<strong style="color:#FF6B35;">「下载报告」</strong>两个按钮。'
+                        '前者通过浏览器打印对话框导出纯报告 PDF（不含网页其他内容），'
+                        '后者下载独立 HTML 报告文件。'
+                        '</div>'
+                    )
+
+                    with gr.Row():
+                        report_btn = gr.Button(
+                            "📋 生成分析报告",
+                            variant="primary",
+                            size="lg",
+                        )
+                        export_btn = gr.Button(
+                            "💾 下载报告 HTML 文件（备用）",
+                            variant="secondary",
+                            size="lg",
+                        )
+
+                    report_html = gr.HTML(
+                        value='<div style="text-align:center;padding:60px 20px;color:#888;'
+                            'background:#fafafa;border-radius:12px;margin:20px 0;">'
+                            '<p style="font-size:18px;margin-bottom:8px;">📋 点击「生成分析报告」查看完整报告</p>'
+                            '<p style="font-size:14px;">完成舌象分析后，可生成报告并使用报告内的按钮导出 PDF 或下载 HTML</p>'
+                            '</div>',
+                    )
+
+                    report_file = gr.File(
+                        label="备用下载区（点击上方「下载报告 HTML 文件」按钮后，文件将显示在此处）",
+                        visible=True,
+                        interactive=False,
+                    )
+
+                    # ===== 知识库区 =====
+                    gr.Markdown("---")
+                    gr.Markdown("## 📚 中医舌诊知识库")
+                    gr.Markdown(
+                        "> 下方为 **医院标准参考图谱**，每种舌象类型配有示意图与中医释义，"
+                        "可对照识别自身舌象特征。"
+                    )
+                    gr.HTML(build_atlas_html())
+
+                    with gr.Accordion("体质类型对照表", open=False):
+                        constit_table = "| 舌质 | 舌苔 | 体质类型 | 特征 |\n|------|------|----------|------|\n"
+                        for (bk, ck), cinfo in CONSTITUTION_MAP.items():
+                            b_name = TONGUE_BODY_TYPES.get(bk, {}).get("name", bk)
+                            c_name = TONGUE_COATING_TYPES.get(ck, {}).get("name", ck)
+                            constit_table += f"| {b_name} | {c_name} | {cinfo['type']} | {cinfo['feature']} |\n"
+                        gr.Markdown(constit_table)
+
+                    gr.Markdown("---")
+                    gr.Markdown(
+                        "### 📖 项目说明\n"
+                        "本项目由青少年科技训练营开发，采用 **Vibe Coding** 范式构建。\n\n"
+                        "**技术栈**: Python + Gradio + PyTorch (MobileNetV2) + OpenCV + Agnes AI 大模型\n\n"
+                        "**分析方法**: 基于HSV颜色空间的舌体分割 + 颜色特征分析 + 中医知识映射 + Agnes AI 辨证评语\n\n"
+                        "**AI 评语**: 通过 Agnes AI 大模型（兼容 OpenAI 接口）生成中医辨证评语，替代原 Gemini API\n\n"
+                        "**伦理合规**: 非辅助决策类教育软件 · 数据本地处理 · 未成年人保护\n\n"
+                        "---\n"
+                        "⚠️ 本项目为教育演示用途，非医疗器械，不用于临床诊断。"
+                    )
+
+                # ===== 事件绑定 =====
+                # 第一步：舌象分析（21类分类，不调用大模型）
+                analyze_btn.click(
+                    fn=run_tongue_analysis,
+                    inputs=[image_input, consent, minor_consent,
+                            seg_backend_radio],
+                    outputs=[
+                        seg_output,          # 分割结果图
+                        seg_info,            # 分割信息
+                        body_output,         # 舌质分析
+                        coating_output,      # 舌苔分析
+                        constitution_output, # 体质辨识
+                        advice_output,       # 健康建议
+                        commentary_output,   # AI 评语占位
+                    ],
                 )
 
-                # 当前 Key 状态显示
-                _current_fingerprint = get_api_key_fingerprint()
-                agnes_key_status = gr.Markdown(
-                    f"**当前 API Key 状态**：`{_current_fingerprint}`"
+                # 第二步：生成综合报告（大模型 + 问卷）
+                generate_report_btn.click(
+                    fn=generate_comprehensive_report,
+                    inputs=[agnes_api_key_input, agnes_model_input]
+                           + questionnaire_components,
+                    outputs=[commentary_output],
                 )
 
-                with gr.Row():
-                    agnes_api_key_input = gr.Textbox(
-                        label="Agnes AI API Key",
-                        placeholder="在此粘贴你的 Agnes AI API Key（sk-... 或自定义格式）",
-                        type="password",
-                        lines=1,
-                        scale=3,
-                    )
-
-                with gr.Row():
-                    save_key_btn = gr.Button("💾 保存 Key 到本地", variant="secondary", size="sm")
-                    test_key_btn = gr.Button("🔌 测试连接", variant="secondary", size="sm")
-                    clear_key_btn = gr.Button("🗑️ 清除已保存 Key", variant="stop", size="sm")
-
-                with gr.Row():
-                    agnes_model_input = gr.Textbox(
-                        label="模型名称",
-                        value=AGNES_DEFAULT_MODEL,
-                        placeholder="agnes-2.5-pro",
-                        lines=1,
-                        scale=2,
-                    )
-                    use_llm_checkbox = gr.Checkbox(
-                        label="启用 Agnes AI 生成中医评语",
-                        value=True,
-                        scale=1,
-                    )
-
-                key_test_result = gr.Markdown("")
-
-            # ===== 主交互区 =====
-            with gr.Row():
-                # 左侧：输入
-                with gr.Column(scale=1):
-                    gr.Markdown("### 📷 上传或拍摄舌象照片")
-                    image_input = gr.Image(
-                        label="舌象照片",
-                        type="numpy",
-                        sources=["upload", "webcam"],
-                        height=300,
-                    )
-                    seg_backend_radio = gr.Radio(
-                        label="分割后端（选择舌体识别算法）",
-                        choices=[("HSV 色彩阈值法", "hsv"), ("U2-Net 深度学习", "u2net")],
-                        value="hsv",
-                        info="HSV：精度高不含嘴唇，但边缘可能欠分割 | "
-                             "U2-Net：召回率高覆盖全舌体，但可能含嘴唇/面颊。"
-                             "若 U2-Net 不可用（rembg 未安装）将自动回退到 HSV。",
-                    )
-                    analyze_btn = gr.Button(
-                        "🔍 开始舌象分析",
-                        variant="primary",
-                        size="lg",
-                    )
-
-                # 右侧：分割结果
-                with gr.Column(scale=1):
-                    gr.Markdown("### 🔬 舌体分割结果")
-                    seg_output = gr.Image(
-                        label="舌体识别标注",
-                        type="numpy",
-                        height=300,
-                    )
-                    seg_info = gr.Markdown("")
-
-            gr.Markdown("---")
-
-            # ===== 分析结果区 =====
-            gr.Markdown("## 📋 分析结果")
-
-            with gr.Row():
-                with gr.Column():
-                    body_output = gr.Markdown("等待分析...")
-                with gr.Column():
-                    coating_output = gr.Markdown("等待分析...")
-
-            with gr.Row():
-                with gr.Column():
-                    constitution_output = gr.Markdown("")
-
-            gr.Markdown("---")
-
-            with gr.Row():
-                advice_output = gr.Markdown("")
-
-            gr.Markdown("---")
-
-            # ===== AI 中医评语区 =====
-            with gr.Row():
-                commentary_output = gr.Markdown("")
-
-            # ===== 报告生成与导出区 =====
-            gr.Markdown("---")
-            gr.Markdown("## 📄 分析报告")
-            gr.Markdown(
-                '<div style="background:#E6F7FF;border:1px solid #91D5FF;border-radius:8px;'
-                'padding:12px 16px;margin:8px 0 16px;font-size:13px;color:#003A8C;">'
-                '<strong>💡 使用提示：</strong>点击「生成分析报告」后，报告内将显示'
-                '<strong style="color:#00B4D8;">「打印 / 导出 PDF」</strong>和'
-                '<strong style="color:#FF6B35;">「下载报告」</strong>两个按钮。'
-                '前者通过浏览器打印对话框导出纯报告 PDF（不含网页其他内容），'
-                '后者下载独立 HTML 报告文件。'
-                '</div>'
-            )
-
-            with gr.Row():
-                report_btn = gr.Button(
-                    "📋 生成分析报告",
-                    variant="primary",
-                    size="lg",
-                )
-                export_btn = gr.Button(
-                    "💾 下载报告 HTML 文件（备用）",
-                    variant="secondary",
-                    size="lg",
+                # Agnes AI API Key 管理按钮
+                save_key_btn.click(
+                    fn=save_agnes_key_cb,
+                    inputs=[agnes_api_key_input, agnes_model_input],
+                    outputs=[key_test_result, agnes_key_status],
                 )
 
-            # 报告 HTML 展示区（带滚动）
-            report_html = gr.HTML(
-                value='<div style="text-align:center;padding:60px 20px;color:#888;'
-                    'background:#fafafa;border-radius:12px;margin:20px 0;">'
-                    '<p style="font-size:18px;margin-bottom:8px;">📋 点击「生成分析报告」查看完整报告</p>'
-                    '<p style="font-size:14px;">完成舌象分析后，可生成报告并使用报告内的按钮导出 PDF 或下载 HTML</p>'
-                    '</div>',
-            )
+                test_key_btn.click(
+                    fn=test_agnes_key_cb,
+                    inputs=[agnes_api_key_input, agnes_model_input],
+                    outputs=[key_test_result],
+                )
 
-            # 文件下载组件（备用方式：服务端生成 HTML 文件供下载）
-            report_file = gr.File(
-                label="备用下载区（点击上方「下载报告 HTML 文件」按钮后，文件将显示在此处）",
-                visible=True,
-                interactive=False,
-            )
+                clear_key_btn.click(
+                    fn=clear_agnes_key_cb,
+                    inputs=[],
+                    outputs=[key_test_result, agnes_key_status],
+                )
 
-            # ===== 知识库区 =====
-            gr.Markdown("---")
-            gr.Markdown("## 📚 中医舌诊知识库")
-            gr.Markdown(
-                "> 下方为 **医院标准参考图谱**，每种舌象类型配有示意图与中医释义，"
-                "可对照识别自身舌象特征。"
-            )
-            gr.HTML(build_atlas_html())
+                # 报告生成按钮
+                report_btn.click(
+                    fn=generate_report_cb,
+                    inputs=[],
+                    outputs=[report_html],
+                )
 
-            with gr.Accordion("体质类型对照表", open=False):
-                constit_table = "| 舌质 | 舌苔 | 体质类型 | 特征 |\n|------|------|----------|------|\n"
-                for (bk, ck), cinfo in CONSTITUTION_MAP.items():
-                    b_name = TONGUE_BODY_TYPES.get(bk, {}).get("name", bk)
-                    c_name = TONGUE_COATING_TYPES.get(ck, {}).get("name", ck)
-                    constit_table += f"| {b_name} | {c_name} | {cinfo['type']} | {cinfo['feature']} |\n"
-                gr.Markdown(constit_table)
-
-            gr.Markdown("---")
-            gr.Markdown(
-                "### 📖 项目说明\n"
-                "本项目由青少年科技训练营开发，采用 **Vibe Coding** 范式构建。\n\n"
-                "**技术栈**: Python + Gradio + PyTorch (MobileNetV2) + OpenCV + Agnes AI 大模型\n\n"
-                "**分析方法**: 基于HSV颜色空间的舌体分割 + 颜色特征分析 + 中医知识映射 + Agnes AI 辨证评语\n\n"
-                "**AI 评语**: 通过 Agnes AI 大模型（兼容 OpenAI 接口）生成中医辨证评语，替代原 Gemini API\n\n"
-                "**伦理合规**: 非辅助决策类教育软件 · 数据本地处理 · 未成年人保护\n\n"
-                "---\n"
-                "⚠️ 本项目为教育演示用途，非医疗器械，不用于临床诊断。"
-            )
-
-            # ===== 事件绑定 =====
-            analyze_btn.click(
-                fn=run_analysis,
-                inputs=[image_input, consent, minor_consent,
-                        agnes_api_key_input, agnes_model_input, use_llm_checkbox,
-                        seg_backend_radio],
-                outputs=[
-                    seg_output,          # 分割结果图
-                    seg_info,            # 分割信息
-                    body_output,         # 舌质分析
-                    coating_output,      # 舌苔分析
-                    constitution_output, # 体质辨识
-                    advice_output,       # 健康建议
-                    commentary_output,   # AI 中医评语
-                    gr.Textbox(visible=False),  # placeholder
-                ],
-            )
-
-            # Agnes AI API Key 管理按钮
-            save_key_btn.click(
-                fn=save_agnes_key_cb,
-                inputs=[agnes_api_key_input, agnes_model_input],
-                outputs=[key_test_result, agnes_key_status],
-            )
-
-            test_key_btn.click(
-                fn=test_agnes_key_cb,
-                inputs=[agnes_api_key_input, agnes_model_input],
-                outputs=[key_test_result],
-            )
-
-            clear_key_btn.click(
-                fn=clear_agnes_key_cb,
-                inputs=[],
-                outputs=[key_test_result, agnes_key_status],
-            )
-
-            # 报告生成按钮：在页面内展示 HTML 报告
-            report_btn.click(
-                fn=generate_report_cb,
-                inputs=[],
-                outputs=[report_html],
-            )
-
-            # 导出按钮：保存 HTML 文件供下载
-            export_btn.click(
-                fn=export_report_file_cb,
-                inputs=[],
-                outputs=[report_file],
-            )
+                export_btn.click(
+                    fn=export_report_file_cb,
+                    inputs=[],
+                    outputs=[report_file],
+                )
 
     return app
 

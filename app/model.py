@@ -42,6 +42,9 @@ from .knowledge import (
 )
 from .utils import load_image, create_color_swatch
 from .llm import generate_tcm_commentary, generate_fallback_commentary
+from .questionnaire import format_questionnaire_for_llm
+from .tongue_features import analyze_all_features
+from .atlas import YOLO_CLASSES
 
 # 模型保存路径
 MODEL_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models")
@@ -51,6 +54,23 @@ COATING_MODEL_PATH = os.path.join(MODEL_DIR, "coating_mobilenetv2.pth")
 # 分类标签
 TONGUE_BODY_LABELS = list(TONGUE_BODY_TYPES.keys())
 COATING_LABELS = list(TONGUE_COATING_TYPES.keys())
+
+# 旧11类 → YOLO 21类映射
+BODY_TO_YOLO = {
+    "pale_red": 0,   # 健康舌
+    "pale": 0,        # 健康舌（偏淡）
+    "red": 2,         # 红舌
+    "crimson": 2,     # 红舌（深红）
+    "purple": 3,      # 紫舌
+}
+COATING_TO_YOLO = {
+    "thin_white": 1,       # 薄苔
+    "thick_white": 9,      # 白苔
+    "yellow": 10,          # 黄苔
+    "greasy_yellow": 10,   # 黄苔（腻）
+    "peeled": 12,          # 花苔
+    "gray_black": 11,      # 黑苔
+}
 
 # 图像预处理（用于深度学习模型，仅在 torch 可用时定义）
 if TORCH_AVAILABLE:
@@ -139,6 +159,7 @@ def analyze_tongue(
     agnes_model: str = "agnes-2.5-pro",
     use_llm: bool = True,
     backend: str = "hsv",
+    questionnaire_answers: Optional[dict] = None,
 ) -> dict:
     """
     舌象分析主函数 - 完整推理流程。
@@ -150,7 +171,7 @@ def analyze_tongue(
     4. 舌苔颜色分析
     5. 体质判断
     6. 生成健康科普建议
-    7. 调用 Agnes AI 大模型生成中医辨证评语（可选）
+    7. 调用 Agnes AI 大模型生成中医辨证评语（含问卷综合分析+疾病风险预测）
 
     参数:
         image_input: PIL.Image / numpy数组 / 文件路径
@@ -162,6 +183,8 @@ def analyze_tongue(
             - "hsv": HSV 色彩阈值法，精度高不含嘴唇，但边缘可能欠分割
             - "u2net": U2-Net 深度学习分割，召回率高覆盖全舌体，但可能含嘴唇/面颊
               若 rembg 未安装或推理异常，自动回退到 HSV
+        questionnaire_answers: 问卷答案字典 {question_id: option_index}（可选）
+            提供后大模型将综合舌象+问卷给出体质判断、健康建议和疾病风险预测
 
     返回:
         dict 包含完整分析结果（含 ai_commentary 字段）
@@ -244,11 +267,41 @@ def analyze_tongue(
     # 步骤6: 生成健康建议
     advice = get_health_advice(body_result["body_key"], coating_result["coating_key"])
 
+    # 步骤7: 21类特征分析（舌体形态 + 舌面特征 + 脏腑分区凹凸）
+    if mask.sum() > 0:
+        features_result = analyze_all_features(resized_array, mask)
+        print(f"[TongueAI] 21类特征分析完成，检测到: {features_result['detected_yolo_ids']}")
+    else:
+        features_result = {
+            "shape": {"shape": "normal", "yolo_id": None, "description": "分割失败"},
+            "red_spots": {"detected": False, "yolo_id": None, "spot_count": 0, "description": "分割失败"},
+            "cracks": {"detected": False, "yolo_id": None, "crack_lines": 0, "description": "分割失败"},
+            "teeth_marks": {"detected": False, "yolo_id": None, "indentation_ratio": 0, "description": "分割失败"},
+            "organ_regions": {},
+            "detected_yolo_ids": [],
+        }
+
+    # 映射舌质/舌苔到 YOLO 21类 ID
+    body_yolo_id = BODY_TO_YOLO.get(body_result["body_key"], 0)
+    coating_yolo_id = COATING_TO_YOLO.get(coating_result["coating_key"], 1)
+
+    # 汇总所有检测到的 YOLO 类别（含舌质+舌苔+形态+特征+分区）
+    all_yolo_ids = [body_yolo_id, coating_yolo_id] + features_result["detected_yolo_ids"]
+    all_yolo_ids = sorted(set(all_yolo_ids))
+
+    # 构建检测结果摘要（供 LLM 使用）
+    yolo_labels = []
+    for yid in all_yolo_ids:
+        if yid in YOLO_CLASSES:
+            label = YOLO_CLASSES[yid].copy()
+            label["id"] = yid
+            yolo_labels.append(label)
+
     # 获取检测到的舌体平均颜色
     from .utils import compute_mean_color
     mean_color = compute_mean_color(resized_array, mask)
 
-    # 组装基础分析结果
+    # 组装基础分析结果（含21类完整分类）
     base_result = {
         "segmentation": seg_result,
         "tongue_body": body_result,
@@ -259,9 +312,20 @@ def analyze_tongue(
         "color_swatch_html": create_color_swatch(mean_color),
         "ml_model_used": ml_available,
         "image_size": img.size,
+        # ===== 21类分类结果 =====
+        "features": features_result,
+        "yolo_ids": all_yolo_ids,
+        "yolo_labels": yolo_labels,
+        "body_yolo_id": body_yolo_id,
+        "coating_yolo_id": coating_yolo_id,
     }
 
-    # 步骤7: 调用 Agnes AI 大模型生成中医辨证评语（可选）
+    # 步骤8: 调用 Agnes AI 大模型生成中医辨证评语（含问卷综合分析+疾病风险预测）
+    questionnaire_text = ""
+    if questionnaire_answers:
+        questionnaire_text = format_questionnaire_for_llm(questionnaire_answers)
+        print("[TongueAI] 已注入问卷数据，大模型将综合舌象+问卷进行分析")
+
     if use_llm:
         print("[TongueAI] 正在调用 Agnes AI 生成中医评语...")
         commentary_result = generate_tcm_commentary(
@@ -270,24 +334,29 @@ def analyze_tongue(
             model=agnes_model,
             temperature=0.3,
             max_tokens=8000,
+            questionnaire_text=questionnaire_text,
         )
 
         if commentary_result["success"]:
             print(f"[TongueAI] Agnes AI 评语生成成功（模型: {commentary_result['model']}）")
             ai_commentary = commentary_result["comment"]
             ai_commentary_source = "agnes_ai"
+            ai_commentary_error = None
         else:
             # API 调用失败，回退到基于知识库的规则评语
-            print(f"[TongueAI] Agnes AI 调用失败: {commentary_result['error']}，使用规则回退")
+            ai_commentary_error = commentary_result.get("error", "未知错误")
+            print(f"[TongueAI] Agnes AI 调用失败: {ai_commentary_error}，使用规则回退")
             ai_commentary = generate_fallback_commentary(base_result)
             ai_commentary_source = "rule_fallback"
     else:
         # 未启用 LLM，使用规则回退
         ai_commentary = generate_fallback_commentary(base_result)
         ai_commentary_source = "rule_disabled"
+        ai_commentary_error = None
 
     base_result["ai_commentary"] = ai_commentary
     base_result["ai_commentary_source"] = ai_commentary_source
+    base_result["ai_commentary_error"] = ai_commentary_error
     base_result["ai_commentary_success"] = (
         use_llm and commentary_result["success"] if use_llm else False
     )

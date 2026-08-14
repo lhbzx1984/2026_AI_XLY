@@ -23,6 +23,8 @@ from typing import Optional
 import urllib.request
 import urllib.error
 
+from .atlas import YOLO_CLASSES
+
 # ============================================================
 # 配置常量
 # ============================================================
@@ -38,8 +40,11 @@ PROMPT_FILE = os.path.join(os.path.dirname(__file__), "prompts", "system_prompt.
 # 预测块占位符
 PREDICTIONS_PLACEHOLDER = "{{PREDICTIONS}}"
 
+# 问卷数据占位符
+QUESTIONNAIRE_PLACEHOLDER = "{{QUESTIONNAIRE}}"
+
 # 用户触发消息（固定，不随分析结果变化）
-USER_TRIGGER = "请依据上述判读数据，按规则输出大众版中医舌诊报告。"
+USER_TRIGGER = "请依据上述判读数据和问卷信息，按规则输出大众版中医舌诊报告（含疾病风险预测）。"
 
 # 错误标记前缀
 ERROR_STAMP = "⚠ AI评语生成失败："
@@ -47,8 +52,8 @@ ERROR_STAMP = "⚠ AI评语生成失败："
 # API Key 存储文件（用户自定义目录，避免提交到版本库）
 API_KEY_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".agnes_api_key")
 
-# 请求超时（秒）
-REQUEST_TIMEOUT = 60
+# 请求超时（秒）—— 推理模型(agnes-2.5-pro)需要较长思考时间
+REQUEST_TIMEOUT = 120
 
 
 # ============================================================
@@ -171,10 +176,13 @@ def validate_prompt(template: str) -> None:
         raise PromptValidationError(f"提示词只能有一个 {PREDICTIONS_PLACEHOLDER} 标记，目前有 {count} 个。")
 
 
-def render_system_prompt(template: str, predictions_block: str) -> str:
-    """将预测块注入系统提示词模板的 {{PREDICTIONS}} 位置。"""
+def render_system_prompt(template: str, predictions_block: str, questionnaire_block: str = "") -> str:
+    """将预测块和问卷数据注入系统提示词模板。"""
     validate_prompt(template)
-    return template.replace(PREDICTIONS_PLACEHOLDER, predictions_block)
+    rendered = template.replace(PREDICTIONS_PLACEHOLDER, predictions_block)
+    if QUESTIONNAIRE_PLACEHOLDER in rendered:
+        rendered = rendered.replace(QUESTIONNAIRE_PLACEHOLDER, questionnaire_block or "（用户未填写问卷）")
+    return rendered
 
 
 # ============================================================
@@ -184,6 +192,7 @@ def render_system_prompt(template: str, predictions_block: str) -> str:
 def render_predictions_block(result: dict) -> str:
     """
     将舌象分析结果渲染为预测块文本，用于注入系统提示词。
+    包含21类完整分类结果：舌质颜色、舌体形态、舌面特征、舌苔、脏腑分区凹凸。
 
     参数:
         result: analyze_tongue() 返回的分析结果字典
@@ -196,42 +205,90 @@ def render_predictions_block(result: dict) -> str:
     constitution = result.get("constitution", {})
     seg = result.get("segmentation", {})
     mean_color = result.get("mean_color", (0, 0, 0))
+    features = result.get("features", {})
+    yolo_labels = result.get("yolo_labels", [])
 
     lines = []
 
-    # 舌质
+    # ===== 一、舌质颜色 =====
     body_name = body.get("name", "未知")
     body_meaning = body.get("tcm_meaning", "")
     body_conf = body.get("confidence")
+    body_yolo_id = result.get("body_yolo_id", 0)
     if body_conf is not None:
-        lines.append(f"- 舌质：{body_name}（{body_meaning}，置信度 {body_conf:.2f}）")
+        lines.append(f"- 舌质颜色：{body_name}（{body_meaning}，置信度 {body_conf:.2f}）[YOLO类{body_yolo_id}]")
     else:
-        lines.append(f"- 舌质：{body_name}（{body_meaning}）")
+        lines.append(f"- 舌质颜色：{body_name}（{body_meaning}）[YOLO类{body_yolo_id}]")
 
-    # 舌苔
+    # ===== 二、舌体形态 =====
+    shape_data = features.get("shape", {})
+    if shape_data.get("yolo_id") is not None:
+        shape_name = YOLO_CLASSES.get(shape_data["yolo_id"], {}).get("name", "异常")
+        lines.append(f"- 舌体形态：{shape_name}（{shape_data.get('description', '')}）"
+                     f"[YOLO类{shape_data['yolo_id']}]")
+    else:
+        lines.append(f"- 舌体形态：正常（宽高比{shape_data.get('aspect_ratio', 'N/A')}，"
+                     f"覆盖率{shape_data.get('coverage', 'N/A')}）")
+
+    # ===== 三、舌面特征 =====
+    red_spots = features.get("red_spots", {})
+    cracks = features.get("cracks", {})
+    teeth_marks = features.get("teeth_marks", {})
+
+    feature_parts = []
+    if red_spots.get("detected"):
+        feature_parts.append(f"红点舌（检测到{red_spots.get('spot_count', 0)}个红点）[YOLO类6]")
+    if cracks.get("detected"):
+        feature_parts.append(f"裂纹舌（{cracks.get('crack_lines', 0)}条裂纹）[YOLO类7]")
+    if teeth_marks.get("detected"):
+        feature_parts.append(f"齿痕舌（凹陷度{teeth_marks.get('indentation_ratio', 'N/A')}）[YOLO类8]")
+
+    if feature_parts:
+        lines.append(f"- 舌面特征：{'；'.join(feature_parts)}")
+    else:
+        lines.append("- 舌面特征：未见明显异常（无红点、裂纹、齿痕）")
+
+    # ===== 四、舌苔 =====
     coat_name = coating.get("name", "未知")
     coat_meaning = coating.get("tcm_meaning", "")
     coat_conf = coating.get("confidence")
+    coat_yolo_id = result.get("coating_yolo_id", 1)
     if coat_conf is not None:
-        lines.append(f"- 舌苔：{coat_name}（{coat_meaning}，置信度 {coat_conf:.2f}）")
+        lines.append(f"- 舌苔：{coat_name}（{coat_meaning}，置信度 {coat_conf:.2f}）[YOLO类{coat_yolo_id}]")
     else:
-        lines.append(f"- 舌苔：{coat_name}（{coat_meaning}）")
+        lines.append(f"- 舌苔：{coat_name}（{coat_meaning}）[YOLO类{coat_yolo_id}]")
 
-    # 体质
+    # ===== 五、脏腑分区凹凸 =====
+    organ_data = features.get("organ_regions", {})
+    organ_parts = []
+    for organ_name in ["心肺", "脾胃", "肾", "肝胆"]:
+        od = organ_data.get(organ_name, {})
+        state = od.get("state")
+        if state:
+            organ_parts.append(f"{organ_name}{state}[YOLO类{od.get('yolo_id', '?')}]")
+        else:
+            organ_parts.append(f"{organ_name}正常")
+
+    lines.append(f"- 脏腑分区：{'；'.join(organ_parts)}")
+
+    # ===== 六、体质 =====
     constit_type = constitution.get("type", "未知")
     constit_feature = constitution.get("feature", "")
-    lines.append(f"- 体质：{constit_type}（{constit_feature}）")
+    lines.append(f"- 体质初判：{constit_type}（{constit_feature}）")
 
-    # 舌体平均颜色
+    # ===== 七、检测到的 YOLO 类别总览 =====
+    if yolo_labels:
+        yolo_summary = "、".join(f"{yl['name']}(类{yl['id']})" for yl in yolo_labels)
+        lines.append(f"- 21类检测结果：{yolo_summary}")
+
+    # ===== 八、辅助信息 =====
     if mean_color:
         lines.append(f"- 检测舌体平均颜色：RGB({int(mean_color[0])}, {int(mean_color[1])}, {int(mean_color[2])})")
 
-    # 分割覆盖率
     coverage = seg.get("coverage")
     if coverage is not None:
         lines.append(f"- 舌体分割覆盖率：{coverage:.1%}")
 
-    # 分析方法（结合分割后端 + 推理方式）
     ml_used = result.get("ml_model_used", False)
     _backend_labels = {
         "hsv": "HSV 色彩阈值分割",
@@ -241,7 +298,7 @@ def render_predictions_block(result: dict) -> str:
     }
     seg_backend = seg.get("backend", "hsv")
     seg_label = _backend_labels.get(seg_backend, seg_backend)
-    inference_label = "深度学习模型" if ml_used else "规则推理（颜色特征）"
+    inference_label = "深度学习模型" if ml_used else "规则推理（颜色特征+形态分析）"
     lines.append(f"- 分析方法：{seg_label} + {inference_label}")
 
     return "\n".join(lines) if lines else "- （无可用判读数据）"
@@ -342,17 +399,19 @@ def generate_tcm_commentary(
     user_api_key: Optional[str] = None,
     model: str = AGNES_DEFAULT_MODEL,
     temperature: float = 0.3,
-    max_tokens: int = 4000,
+    max_tokens: int = 8000,
+    questionnaire_text: str = "",
 ) -> dict:
     """
-    根据舌象分析结果，调用 Agnes AI 生成中医辨证评语。
+    根据舌象分析结果和问卷数据，调用 Agnes AI 生成中医辨证评语（含疾病风险预测）。
 
     参数:
         result: analyze_tongue() 返回的分析结果字典
         user_api_key: 用户在 UI 中输入的 API Key（可选，优先使用）
         model: Agnes AI 模型名称
         temperature: 生成温度（越低越确定）
-        max_tokens: 最大生成 token 数
+        max_tokens: 最大生成 token 数（含推理模型思考过程，需足够大）
+        questionnaire_text: 格式化的问卷文本（供大模型参考）
 
     返回:
         dict 包含:
@@ -365,10 +424,10 @@ def generate_tcm_commentary(
     # 渲染预测块
     predictions_block = render_predictions_block(result)
 
-    # 加载并渲染系统提示词
+    # 加载并渲染系统提示词（含问卷数据）
     try:
         template = load_system_prompt()
-        system_prompt = render_system_prompt(template, predictions_block)
+        system_prompt = render_system_prompt(template, predictions_block, questionnaire_text)
     except PromptValidationError as e:
         return {
             "comment": f"{ERROR_STAMP}{type(e).__name__}: {e}",

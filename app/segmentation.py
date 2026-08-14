@@ -380,8 +380,8 @@ def segment_tongue_u2net(image_input) -> dict:
     kernel_light = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     roi_mask = cv2.dilate(clean_mask, kernel_light, iterations=1)
 
-    # Step 3b: 在 ROI 内做严格舌体颜色过滤
-    # 舌体颜色特征：红色优势 R - max(G, B) > 5（嘴唇通常 0-4，皮肤通常 < 3）
+    # Step 3b: 在 ROI 内做自适应舌体颜色过滤
+    # 舌体颜色特征：红色优势 R - max(G, B) > 阈值（嘴唇通常 0-4，皮肤通常 < 3）
     hsv = cv2.cvtColor(img_array, cv2.COLOR_RGB2HSV)
     hue = hsv[:, :, 0].astype(np.float32)
     sat = hsv[:, :, 1].astype(np.float32)
@@ -395,45 +395,72 @@ def segment_tongue_u2net(image_input) -> dict:
     # - 红色调：hue < 25 或 hue > 155，sat > 10，val > 40
     # - 紫色调（青紫舌）：hue 115-175，sat > 5
     # - 淡白/粉色：red_adv > 0 且 sat < 50
-    # - 红色优势 > 5（关键：排除嘴唇和皮肤）
     red_hue = (hue < 25) | (hue > 155)
     purple_hue = (hue > 115) & (hue < 175)
     pale_pink = (red_adv > 0) & (sat < 50) & (val > 80)
 
-    tongue_color_mask = (
-        ((red_hue & (sat > 10) & (val > 40)) | purple_hue | pale_pink)
-        & (red_adv > 5)  # 严格红色优势阈值，排除嘴唇/皮肤
-        & (val < 245)    # 排除高光过曝
-    )
-
-    # 在 ROI 内取交集
-    clean_mask = np.where(roi_mask > 0, tongue_color_mask.astype(np.uint8) * 255, 0).astype(np.uint8)
-
-    # Step 3c: YCbCr 皮肤检测，排除残留皮肤像素
+    # YCbCr 皮肤检测
     skin_mask = _detect_skin_ycbcr(img_array)
-    # 皮肤且红色优势 < 8 的像素，从 clean_mask 中扣除
-    skin_to_remove = skin_mask & (red_adv < 8)
-    clean_mask[skin_to_remove] = 0
-
-    # Step 3d: 形态学清理（闭运算 + 填充孔洞）
     kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    clean_mask = cv2.morphologyEx(clean_mask, cv2.MORPH_CLOSE, kernel_close)
-    clean_mask = _fill_holes(clean_mask)
-    clean_mask = _smooth_mask(clean_mask, blur_ksize=5)
 
-    # Step 3e: 连通域分析，保留最大区域（去除离散斑块）
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
-        clean_mask, connectivity=8
-    )
-    if num_labels > 2:
-        max_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
-        clean_mask = np.where(labels == max_label, 255, 0).astype(np.uint8)
+    # 自适应阈值：U2-Net 过分割时（ROI 覆盖率高），逐步收紧 red_adv 阈值
+    # 从宽松到严格：3 → 8 → 15 → 20 → 30 → 40，选择使覆盖率 < 0.45 的最低阈值
+    # 保证正常图片用宽松阈值（不丢淡白舌），过分割图片自动收紧
+    red_adv_thresholds = [3, 8, 15, 20, 30, 40]
+    best_clean_mask = None
 
-    # 防御：颜色过滤后 mask 可能为空，回退到 U2-Net 原始 mask（不再做颜色过滤）
-    if clean_mask.sum() == 0:
+    for red_thresh in red_adv_thresholds:
+        tongue_color_mask = (
+            ((red_hue & (sat > 10) & (val > 40)) | purple_hue | pale_pink)
+            & (red_adv > red_thresh)
+            & (val < 245)    # 排除高光过曝
+        )
+
+        # 在 ROI 内取交集
+        test_mask = np.where(roi_mask > 0, tongue_color_mask.astype(np.uint8) * 255, 0).astype(np.uint8)
+
+        # YCbCr 皮肤排除：排除红色优势低于当前阈值的皮肤像素
+        skin_to_remove = skin_mask & (red_adv < red_thresh + 2)
+        test_mask[skin_to_remove] = 0
+
+        # 形态学清理（闭运算 + 填充孔洞）
+        test_mask = cv2.morphologyEx(test_mask, cv2.MORPH_CLOSE, kernel_close)
+        test_mask = _fill_holes(test_mask)
+
+        # 连通域分析，保留最大区域（去除离散斑块）
+        num_labels_t, labels_t, stats_t, _ = cv2.connectedComponentsWithStats(
+            test_mask, connectivity=8
+        )
+        if num_labels_t > 2:
+            max_label_t = 1 + np.argmax(stats_t[1:, cv2.CC_STAT_AREA])
+            test_mask = np.where(labels_t == max_label_t, 255, 0).astype(np.uint8)
+
+        test_cov = test_mask.sum() / 255 / total_area
+
+        # 形状有效性检查（长宽比 0.25-2.8）
+        shape_ok = False
+        if test_cov > 0.005:
+            cnts_t, _ = cv2.findContours(test_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if cnts_t:
+                cnt_t = max(cnts_t, key=cv2.contourArea)
+                x_t, y_t, w_t, h_t = cv2.boundingRect(cnt_t)
+                aspect_t = w_t / max(h_t, 1)
+                shape_ok = (0.25 < aspect_t < 2.8)
+
+        if test_cov > 0.005 and shape_ok:  # mask 不为空且形状有效
+            best_clean_mask = test_mask
+            if test_cov < 0.45:
+                break  # 覆盖率合理，停止收紧
+
+    # 使用自适应过滤的最佳结果
+    if best_clean_mask is not None:
+        clean_mask = _smooth_mask(best_clean_mask, blur_ksize=5)
+    else:
+        # 防御：所有阈值下 mask 都为空，回退到 U2-Net 原始 mask
         clean_mask = u2net_mask.copy()
         clean_mask = cv2.morphologyEx(clean_mask, cv2.MORPH_CLOSE, kernel_close)
         clean_mask = _fill_holes(clean_mask)
+        clean_mask = _smooth_mask(clean_mask, blur_ksize=5)
 
     # Step 3f: 高宽比约束（排除下巴但保留舌尖，与 HSV 后端一致）
     ys, xs = np.where(clean_mask > 0)
@@ -462,7 +489,7 @@ def segment_tongue_u2net(image_input) -> dict:
         final_aspect = fw / max(fh, 1)
         shape_valid = (0.25 < final_aspect < 2.8)
 
-        if 0.005 < coverage < 0.45 and shape_valid:
+        if 0.005 < coverage < 0.85 and shape_valid:
             # 边界平滑：拉普拉斯 + Catmull-Rom 样条
             peri = cv2.arcLength(final_cnt, True)
             approx = cv2.approxPolyDP(final_cnt, 0.006 * peri, True)
