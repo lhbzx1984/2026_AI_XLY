@@ -53,7 +53,7 @@ ERROR_STAMP = "⚠ AI评语生成失败："
 API_KEY_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".agnes_api_key")
 
 # 请求超时（秒）—— 推理模型(agnes-2.5-pro)需要较长思考时间
-REQUEST_TIMEOUT = 120
+REQUEST_TIMEOUT = 180
 
 
 # ============================================================
@@ -467,10 +467,39 @@ def generate_tcm_commentary(
             "predictions_block": predictions_block,
         }
     except Exception as e:
+        error_msg = str(e)
+        # 超时错误时，自动降级到 agnes-2.5-flash（响应更快，约 30 秒）
+        is_timeout = "timed out" in error_msg.lower() or "timeout" in type(e).__name__.lower()
+        if is_timeout and model != "agnes-2.5-flash":
+            print(f"[LLM] {model} 超时，自动降级到 agnes-2.5-flash 重试...")
+            try:
+                comment = _call_agnes_api(
+                    system_prompt=system_prompt,
+                    user_message=USER_TRIGGER,
+                    api_key=api_key,
+                    model="agnes-2.5-flash",
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                return {
+                    "comment": comment,
+                    "success": True,
+                    "error": None,
+                    "model": "agnes-2.5-flash",
+                    "predictions_block": predictions_block,
+                }
+            except Exception as e2:
+                return {
+                    "comment": f"{ERROR_STAMP}{type(e2).__name__}: {e2}",
+                    "success": False,
+                    "error": str(e2),
+                    "model": "agnes-2.5-flash",
+                    "predictions_block": predictions_block,
+                }
         return {
             "comment": f"{ERROR_STAMP}{type(e).__name__}: {e}",
             "success": False,
-            "error": str(e),
+            "error": error_msg,
             "model": model,
             "predictions_block": predictions_block,
         }
