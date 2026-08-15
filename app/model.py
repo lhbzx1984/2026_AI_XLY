@@ -295,6 +295,13 @@ def analyze_tongue(
         if yid in YOLO_CLASSES:
             label = YOLO_CLASSES[yid].copy()
             label["id"] = yid
+            # 舌质分析判定为绛舌时，将21类中的"红舌"修正为"绛舌"（保持与舌质分析一致）
+            if yid == 2 and body_result.get("body_key") == "crimson":
+                from .knowledge import TONGUE_BODY_TYPES
+                kb = TONGUE_BODY_TYPES.get("crimson", {})
+                label["name"] = kb.get("name", "绛舌")
+                label["tcm_meaning"] = kb.get("tcm_meaning", "热盛伤阴或阴虚火旺")
+                label["advice"] = kb.get("advice", label.get("advice", ""))
             yolo_labels.append(label)
 
     # 获取检测到的舌体平均颜色
