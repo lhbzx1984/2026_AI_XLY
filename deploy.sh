@@ -32,6 +32,7 @@ RUN_USER="${SUDO_USER:-$(whoami)}"
 AGNES_API_KEY=""
 WITH_U2NET=false
 WITH_NGINX=false
+SKIP_LFS=false
 REPO_URL="https://github.com/lhbzx1984/2026_AI_XLY.git"
 
 # ---------- 参数解析 ----------
@@ -41,6 +42,7 @@ for arg in "$@"; do
         --with-u2net)    WITH_U2NET=true;;
         --with-nginx)    WITH_NGINX=true;;
         --with-ml)       WITH_ML=true;;
+        --skip-lfs)      SKIP_LFS=true;;
         --repo=*)        REPO_URL="${arg#*=}";;
         --port=*)        APP_PORT="${arg#*=}";;
         --help|-h)
@@ -51,6 +53,7 @@ for arg in "$@"; do
             echo "  --with-u2net       安装 U2-Net 分割后端（rembg + onnxruntime）"
             echo "  --with-ml          安装 PyTorch 深度学习依赖（体积大，约 2GB）"
             echo "  --with-nginx       配置 Nginx 反向代理（80 → ${APP_PORT}）"
+            echo "  --skip-lfs         跳过 Git LFS 大文件下载（手动上传 models/u2net.onnx）"
             echo "  --repo=URL         指定 Git 仓库地址（默认：${REPO_URL}）"
             echo "  --port=PORT        指定应用端口（默认：${APP_PORT}）"
             echo "  --help             显示帮助"
@@ -163,8 +166,12 @@ fetch_project() {
     fi
 
     # 拉取 Git LFS 大文件（如 models/u2net.onnx，约 176MB）
-    log_info "拉取 LFS 大文件（如 U2-Net 模型）..."
-    git lfs pull || log_warn "git lfs pull 失败，U2-Net 本地模型可能缺失（rembg 会在首次使用时自动下载）"
+    if [[ "${SKIP_LFS:-false}" == true ]]; then
+        log_warn "已跳过 LFS 大文件下载（--skip-lfs），请手动上传 models/u2net.onnx"
+    else
+        log_info "拉取 LFS 大文件（如 U2-Net 模型）..."
+        git lfs pull || log_warn "git lfs pull 失败，U2-Net 本地模型可能缺失（rembg 会在首次使用时自动下载）"
+    fi
 
     log_ok "项目代码就绪"
 
