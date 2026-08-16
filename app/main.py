@@ -573,7 +573,31 @@ def generate_comprehensive_report(agnes_api_key, agnes_model, *questionnaire_val
         if questionnaire_answers:
             questionnaire_note = "\n\n📝 **已结合问卷数据综合分析**（基础症状 + 生活习惯 + 既往病史），含疾病风险预测。"
 
-        return f"""### 🤖 AI 中医辨证评语
+        # 创建智能解读会话
+        chat_btn = ""
+        try:
+            from app.chat_assistant import create_session
+            session_id = create_session(_last_result)
+            chat_btn = (
+                f'<div style="text-align:center; margin: 24px 0;">'
+                f'<a href="/chat?session={session_id}" target="_blank" '
+                f'style="display:inline-block; background:linear-gradient(135deg, #2A9D8F, #1E7268); '
+                f'color:#fff; padding:14px 36px; border-radius:12px; '
+                f'text-decoration:none; font-size:16px; font-weight:600; '
+                f'box-shadow:0 4px 12px rgba(42,157,143,0.3); transition:all 0.2s;" '
+                f'onmouseover="this.style.transform=\'translateY(-2px)\';this.style.boxShadow=\'0 6px 20px rgba(42,157,143,0.4)\'" '
+                f'onmouseout="this.style.transform=\'translateY(0)\';this.style.boxShadow=\'0 4px 12px rgba(42,157,143,0.3)\'">'
+                f'🤖 智能解读咨询（AI 对话助手）'
+                f'</a>'
+                f'<p style="font-size:13px; color:#888; margin-top:8px;">'
+                f'看不懂报告？点击与 AI 医生对话，获取个性化解读建议'
+                f'</p>'
+                f'</div>'
+            )
+        except Exception as cs_err:
+            print(f"[TongueAI] 创建对话会话失败: {cs_err}")
+
+        commentary_md = f"""### 🤖 AI 中医辨证评语
 
 {source_label}{questionnaire_note}
 
@@ -586,16 +610,18 @@ def generate_comprehensive_report(agnes_api_key, agnes_model, *questionnaire_val
 ⚠️ **重要提醒**: AI 评语由大语言模型生成，仅供参考，不构成医疗诊断或治疗建议。
 疾病风险预测仅为健康提示，如有健康问题，请务必咨询专业中医师或西医就诊。
 """
+        return commentary_md, chat_btn
 
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return f"""### 🤖 AI 中医辨证评语
+        error_md = f"""### 🤖 AI 中医辨证评语
 
 ❌ 生成综合报告时出错: {str(e)}
 
 请检查 API Key 配置和网络连接后重试。
 """
+        return error_md, ""
 
 
 # ============================================================
@@ -866,6 +892,12 @@ def create_app():
                             '</div>',
                     )
 
+                    # 智能解读咨询按钮（生成综合报告后可用）
+                    chat_btn_html = gr.HTML(
+                        value='',
+                        visible=True,
+                    )
+
                     report_file = gr.File(
                         label="备用下载区（点击上方「下载报告 HTML 文件」按钮后，文件将显示在此处）",
                         visible=True,
@@ -923,7 +955,7 @@ def create_app():
                     fn=generate_comprehensive_report,
                     inputs=[agnes_api_key_input, agnes_model_input]
                            + questionnaire_components,
-                    outputs=[commentary_output],
+                    outputs=[commentary_output, chat_btn_html],
                 )
 
                 # Agnes AI API Key 管理按钮
@@ -966,17 +998,12 @@ def create_app():
 # ============================================================
 if __name__ == "__main__":
     # 绕过 Gradio 4.44 在沙盒环境中的 localhost 连通性检查
-    # （沙盒内 httpx 访问 0.0.0.0 会失败返回 False，但服务器实际已正常运行）
     import gradio.networking
     import gradio.blocks
     gradio.networking.url_ok = lambda url: True
     gradio.blocks.networking.url_ok = lambda url: True
 
-    app = create_app()
-
-    # 禁用队列：沙盒环境中 SSE 长连接不稳定，会导致前端拿不到分析结果
-    # Gradio 4.44 在 get_config_file() 中硬编码了 enable_queue=True，
-    # 必须 monkey-patch 该方法才能让前端改用同步 HTTP 而非 SSE
+    # 禁用队列：沙盒环境中 SSE 长连接不稳定
     import gradio.blocks as _gb
     _orig_get_config_file = _gb.Blocks.get_config_file
     def _patched_get_config_file(self):
@@ -985,17 +1012,50 @@ if __name__ == "__main__":
         return config
     _gb.Blocks.get_config_file = _patched_get_config_file
 
-    if hasattr(app, "_queue"):
-        app._queue.enabled = False
-    app.enable_queue = False
+    # 创建 FastAPI 应用，挂载 Gradio + 对话助手路由
+    from fastapi import FastAPI
+    from fastapi.responses import HTMLResponse, JSONResponse
+    import gradio as gr
+    import uvicorn
 
-    app.launch(
-        server_name="0.0.0.0",
-        server_port=7860,
-        share=False,  # 设为 True 可生成公网临时链接（72小时，需 Gradio 隧道服务可用）
-        show_error=True,
+    fastapi_app = FastAPI()
+
+    # ===== 对话助手路由 =====
+    @fastapi_app.get("/chat", response_class=HTMLResponse)
+    async def chat_page(session: str = ""):
+        from app.chat_assistant import get_chat_page_html
+        return get_chat_page_html(session)
+
+    @fastapi_app.post("/chat/api/message")
+    async def chat_message(data: dict):
+        from app.chat_assistant import chat_with_agnes
+        message = data.get("message", "")
+        history = data.get("history", [])
+        session_id = data.get("session_id", "")
+        try:
+            reply = chat_with_agnes(message, history, session_id)
+            return JSONResponse({"reply": reply})
+        except Exception as e:
+            return JSONResponse({"error": f"对话服务出错: {str(e)[:100]}"})
+
+    # ===== 创建并挂载 Gradio 主应用 =====
+    gradio_app = create_app()
+
+    if hasattr(gradio_app, "_queue"):
+        gradio_app._queue.enabled = False
+    gradio_app.enable_queue = False
+
+    fastapi_app = gr.mount_gradio_app(
+        fastapi_app,
+        gradio_app,
+        path="/",
         allowed_paths=[
             os.path.join(os.path.dirname(__file__), "static", "images"),
-            tempfile.gettempdir(),  # 允许下载临时目录中的报告文件
+            tempfile.gettempdir(),
         ],
     )
+
+    print("[TongueAI] 服务启动中...")
+    print("[TongueAI] 主页面: http://127.0.0.1:7860/")
+    print("[TongueAI] 对话助手: http://127.0.0.1:7860/chat")
+    uvicorn.run(fastapi_app, host="0.0.0.0", port=7860)
