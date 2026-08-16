@@ -657,25 +657,51 @@ APP_CSS = """
 """ + get_landing_css()
 
 
-# 通过 head 参数注入页面切换 JavaScript（gr.HTML 中的 <script> 不会被执行）
-APP_HEAD = f"<script>{get_landing_js()}</script>"
+# 通过 head 参数注入 JavaScript（确保诊断页可见，不再需要页面切换逻辑）
+APP_HEAD = """
+<script>
+window.addEventListener('DOMContentLoaded', function() {
+    function tcFindPage(id) {
+        var el = document.getElementById(id);
+        if (el) return el;
+        var gradioApp = document.querySelector('gradio-app');
+        if (gradioApp && gradioApp.shadowRoot) {
+            el = gradioApp.shadowRoot.querySelector('#' + id);
+            if (el) return el;
+        }
+        return null;
+    }
+    function tcEnsureVisible(el) {
+        if (!el) return;
+        el.style.setProperty('display', 'block', 'important');
+        var p = el.parentElement;
+        while (p && p.tagName !== 'BODY' && p.tagName !== 'HTML') {
+            if (getComputedStyle(p).display === 'none') {
+                p.style.setProperty('display', 'block', 'important');
+            }
+            p = p.parentElement;
+        }
+    }
+    var diagPage = tcFindPage('tc-page-diag');
+    if (diagPage) {
+        tcEnsureVisible(diagPage);
+    }
+});
+</script>
+"""
 
 
 def create_app():
-    """创建并配置 Gradio 应用（双页面架构：主页 + 诊断页）"""
+    """创建并配置 Gradio 应用（舌象检测页）"""
 
     with gr.Blocks(
-        title="TongueAI Pro · 中医AI舌诊辅助健康识别系统",
+        title="舌象检测 · 中医AI舌诊辅助健康识别系统",
         theme=APP_THEME,
         css=APP_CSS,
         head=APP_HEAD,
     ) as app:
 
-        # ===== 页面1: 商业化科技风主页 =====
-        with gr.Column(elem_id="tc-page-home"):
-            gr.HTML(get_landing_html())
-
-        # ===== 页面2: 诊断功能页 =====
+        # ===== 诊断功能页 =====
         with gr.Column(elem_id="tc-page-diag"):
 
             # 诊断页顶部导航栏（含品牌标识 + 返回首页按钮）
@@ -994,6 +1020,361 @@ def create_app():
 
 
 # ============================================================
+# 主页 HTML（独立入口页面）
+# ============================================================
+def _get_home_html() -> str:
+    """生成主页 HTML（三页架构入口页）"""
+    from app.landing import _img
+    logo_src = _img("atlas/health_tongue.jpg") or ""
+
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TongueAI Pro · 中医AI舌诊辅助健康识别系统</title>
+<style>
+* {{ margin: 0; padding: 0; box-sizing: border-box; }}
+
+:root {{
+  --primary: #2A9D8F;
+  --primary-light: #E0F5F2;
+  --primary-dark: #1E7268;
+  --accent: #F4A261;
+  --accent-light: #FEF3E7;
+  --bg: #F5F9F8;
+  --card-bg: #FFFFFF;
+  --text: #2D3436;
+  --text-light: #636E72;
+  --text-muted: #B2BEC3;
+  --border: #E3E8E6;
+  --shadow: 0 4px 20px rgba(42, 157, 143, 0.08);
+  --shadow-hover: 0 8px 30px rgba(42, 157, 143, 0.15);
+}}
+
+body {{
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+               "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}}
+
+/* ===== 顶部导航栏 ===== */
+.navbar {{
+  background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%);
+  padding: 16px 32px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  box-shadow: 0 2px 12px rgba(0,0,0,0.1);
+}}
+
+.navbar-brand {{
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}}
+
+.navbar-brand-icon {{
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: rgba(255,255,255,0.15);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 22px;
+}}
+
+.navbar-brand-name {{
+  color: #fff;
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+}}
+
+.navbar-brand-sub {{
+  color: rgba(255,255,255,0.7);
+  font-size: 13px;
+  margin-top: 2px;
+}}
+
+/* ===== 主内容区 ===== */
+.main-content {{
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 40px 24px;
+}}
+
+.hero {{
+  text-align: center;
+  max-width: 900px;
+  width: 100%;
+}}
+
+.hero-title {{
+  font-size: 36px;
+  font-weight: 800;
+  color: var(--primary-dark);
+  margin-bottom: 12px;
+  line-height: 1.3;
+}}
+
+.hero-desc {{
+  font-size: 16px;
+  color: var(--text-light);
+  line-height: 1.7;
+  margin-bottom: 48px;
+  max-width: 600px;
+  margin-left: auto;
+  margin-right: auto;
+}}
+
+/* ===== 功能卡片 ===== */
+.cards {{
+  display: flex;
+  gap: 32px;
+  justify-content: center;
+  flex-wrap: wrap;
+}}
+
+.card {{
+  background: var(--card-bg);
+  border-radius: 20px;
+  padding: 40px 36px;
+  width: 340px;
+  box-shadow: var(--shadow);
+  text-decoration: none;
+  color: inherit;
+  transition: all 0.3s ease;
+  border: 2px solid transparent;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  cursor: pointer;
+}}
+
+.card:hover {{
+  transform: translateY(-8px);
+  box-shadow: var(--shadow-hover);
+  border-color: var(--primary);
+}}
+
+.card-icon {{
+  width: 80px;
+  height: 80px;
+  border-radius: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 36px;
+  margin-bottom: 24px;
+}}
+
+.card-icon.diagnosis {{
+  background: linear-gradient(135deg, var(--primary-light), #C8E6E2);
+  color: var(--primary-dark);
+}}
+
+.card-icon.chat {{
+  background: linear-gradient(135deg, var(--accent-light), #FCE4C8);
+  color: var(--accent);
+}}
+
+.card-title {{
+  font-size: 22px;
+  font-weight: 700;
+  margin-bottom: 12px;
+  color: var(--text);
+}}
+
+.card-desc {{
+  font-size: 14px;
+  color: var(--text-light);
+  line-height: 1.6;
+  margin-bottom: 24px;
+}}
+
+.card-features {{
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  margin-bottom: 28px;
+}}
+
+.card-feature {{
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  color: var(--text-light);
+  padding: 8px 12px;
+  background: var(--bg);
+  border-radius: 10px;
+}}
+
+.card-feature-check {{
+  color: var(--primary);
+  font-weight: 700;
+  font-size: 16px;
+}}
+
+.card-btn {{
+  padding: 14px 36px;
+  border-radius: 12px;
+  font-size: 16px;
+  font-weight: 600;
+  text-decoration: none;
+  transition: all 0.2s;
+  display: inline-block;
+}}
+
+.card-btn.primary {{
+  background: linear-gradient(135deg, var(--primary), var(--primary-dark));
+  color: #fff;
+  box-shadow: 0 4px 12px rgba(42,157,143,0.3);
+}}
+
+.card-btn.primary:hover {{
+  transform: scale(1.03);
+  box-shadow: 0 6px 18px rgba(42,157,143,0.4);
+}}
+
+.card-btn.accent {{
+  background: linear-gradient(135deg, var(--accent), #E8915A);
+  color: #fff;
+  box-shadow: 0 4px 12px rgba(244,162,97,0.3);
+}}
+
+.card-btn.accent:hover {{
+  transform: scale(1.03);
+  box-shadow: 0 6px 18px rgba(244,162,97,0.4);
+}}
+
+/* ===== 特性标签 ===== */
+.tags {{
+  display: flex;
+  gap: 12px;
+  justify-content: center;
+  flex-wrap: wrap;
+  margin-top: 48px;
+}}
+
+.tag {{
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  padding: 8px 20px;
+  border-radius: 20px;
+  font-size: 13px;
+  color: var(--text-light);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}}
+
+/* ===== 底部免责声明 ===== */
+.footer {{
+  background: var(--card-bg);
+  border-top: 1px solid var(--border);
+  padding: 24px 32px;
+  text-align: center;
+}}
+
+.footer-disclaimer {{
+  font-size: 13px;
+  color: var(--text-muted);
+  line-height: 1.6;
+  max-width: 700px;
+  margin: 0 auto;
+}}
+
+.footer-copyright {{
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 8px;
+}}
+</style>
+</head>
+<body>
+
+<!-- 顶部导航栏 -->
+<div class="navbar">
+  <div class="navbar-brand">
+    <div class="navbar-brand-icon">👅</div>
+    <div>
+      <div class="navbar-brand-name">TongueAI · Pro</div>
+      <div class="navbar-brand-sub">中医AI舌诊辅助健康识别系统</div>
+    </div>
+  </div>
+</div>
+
+<!-- 主内容区 -->
+<div class="main-content">
+  <div class="hero">
+    <h1 class="hero-title">🌟 AI 驱动的中医舌诊智能分析</h1>
+    <p class="hero-desc">
+      融合传统中医舌诊智慧与现代 AI 深度学习技术，<br>
+      上传舌象照片即可获取舌质舌苔分析、体质辨识与健康建议
+    </p>
+
+    <div class="cards">
+      <!-- 舌象检测卡片 -->
+      <a href="/diagnosis" class="card">
+        <div class="card-icon diagnosis">📸</div>
+        <div class="card-title">舌象检测</div>
+        <div class="card-desc">上传舌象照片，AI 自动分割与分析舌质、舌苔、体质特征</div>
+        <div class="card-features">
+          <div class="card-feature"><span class="card-feature-check">✓</span> 21 类舌象分类检测</div>
+          <div class="card-feature"><span class="card-feature-check">✓</span> U2-Net 深度学习分割</div>
+          <div class="card-feature"><span class="card-feature-check">✓</span> 健康问卷 + AI 综合报告</div>
+        </div>
+        <div class="card-btn primary">开始检测 →</div>
+      </a>
+
+      <!-- 智能对话卡片 -->
+      <a href="/chat" class="card">
+        <div class="card-icon chat">🤖</div>
+        <div class="card-title">智能对话咨询</div>
+        <div class="card-desc">与 AI 中医医生对话，获取个性化的报告解读与健康建议</div>
+        <div class="card-features">
+          <div class="card-feature"><span class="card-feature-check">✓</span> 基于舌象报告上下文</div>
+          <div class="card-feature"><span class="card-feature-check">✓</span> 多轮自然语言对话</div>
+          <div class="card-feature"><span class="card-feature-check">✓</span> 通俗易懂的中医解读</div>
+        </div>
+        <div class="card-btn accent">开始咨询 →</div>
+      </a>
+    </div>
+
+    <div class="tags">
+      <div class="tag">🔬 U2-Net 分割</div>
+      <div class="tag">🧠 Agnes AI 大模型</div>
+      <div class="tag">📋 21 类舌象分类</div>
+      <div class="tag">🌿 中医体质辨识</div>
+      <div class="tag">🔒 本地推理</div>
+    </div>
+  </div>
+</div>
+
+<!-- 底部免责声明 -->
+<div class="footer">
+  <div class="footer-disclaimer">
+    ⚠️ 本项目为教育演示用途，非医疗器械，不用于临床诊断。AI 分析结果仅供参考，如有健康问题请务必咨询专业医生。
+  </div>
+  <div class="footer-copyright">© 2026 TongueAI Pro · 青少年科技训练营 · Vibe Coding 范式构建</div>
+</div>
+
+</body>
+</html>"""
+
+
+# ============================================================
 # 启动应用
 # ============================================================
 if __name__ == "__main__":
@@ -1020,6 +1401,11 @@ if __name__ == "__main__":
 
     fastapi_app = FastAPI()
 
+    # ===== 主页路由 =====
+    @fastapi_app.get("/", response_class=HTMLResponse)
+    async def home_page():
+        return _get_home_html()
+
     # ===== 对话助手路由 =====
     @fastapi_app.get("/chat", response_class=HTMLResponse)
     async def chat_page(session: str = ""):
@@ -1038,7 +1424,7 @@ if __name__ == "__main__":
         except Exception as e:
             return JSONResponse({"error": f"对话服务出错: {str(e)[:100]}"})
 
-    # ===== 创建并挂载 Gradio 主应用 =====
+    # ===== 创建并挂载 Gradio 舌象检测应用 =====
     gradio_app = create_app()
 
     if hasattr(gradio_app, "_queue"):
@@ -1048,7 +1434,7 @@ if __name__ == "__main__":
     fastapi_app = gr.mount_gradio_app(
         fastapi_app,
         gradio_app,
-        path="/",
+        path="/diagnosis",
         allowed_paths=[
             os.path.join(os.path.dirname(__file__), "static", "images"),
             tempfile.gettempdir(),
@@ -1056,6 +1442,7 @@ if __name__ == "__main__":
     )
 
     print("[TongueAI] 服务启动中...")
-    print("[TongueAI] 主页面: http://127.0.0.1:7860/")
+    print("[TongueAI] 主页: http://127.0.0.1:7860/")
+    print("[TongueAI] 舌象检测: http://127.0.0.1:7860/diagnosis")
     print("[TongueAI] 对话助手: http://127.0.0.1:7860/chat")
     uvicorn.run(fastapi_app, host="0.0.0.0", port=7860)

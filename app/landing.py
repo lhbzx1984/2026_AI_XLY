@@ -743,7 +743,7 @@ def get_diagnosis_header_html() -> str:
 <!-- ===== 诊断页顶部导航栏 ===== -->
 <div class="tc-diag-header">
   <div class="tc-diag-header-inner">
-    <div class="tc-diag-brand" onclick="showHomePage()" title="返回首页">
+    <div class="tc-diag-brand" onclick="window.location.href='/'" title="返回首页">
       <div class="tc-diag-brand-icon">
         <svg viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg">
           <circle cx="20" cy="20" r="18" stroke="url(#diagBrandGrad)" stroke-width="2"/>
@@ -768,7 +768,7 @@ def get_diagnosis_header_html() -> str:
       </svg>
       智能舌象分析
     </div>
-    <button class="tc-diag-back-btn" onclick="showHomePage()">
+    <button class="tc-diag-back-btn" onclick="window.location.href='/'">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
         <path d="M19 12H5M12 19l-7-7 7-7"/>
       </svg>
